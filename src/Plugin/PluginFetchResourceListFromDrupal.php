@@ -55,6 +55,12 @@ class PluginFetchResourceListFromDrupal extends AbstractFetchResourceListPlugin
             // The maximum Drupal's JSON:API allows.
             $this->page_size = 50;
         }
+        if (isset($this->settings['batch_size_max'])) {
+            $this->batch_size_max = $this->settings['batch_size_max'];
+        } else {
+            // Set the batch size to the page size as a simple default.
+            $this->batch_size_max = $this->page_size;
+        }
         if (isset($this->settings['jsonapi_pager_data_file_path'])) {
             $this->page_data_file = $this->settings['jsonapi_pager_data_file_path'];
         } else {
@@ -70,118 +76,124 @@ class PluginFetchResourceListFromDrupal extends AbstractFetchResourceListPlugin
 
         $client = new \GuzzleHttp\Client();
         $url = $this->drupal_base_url . '/jsonapi/node/' . $this->drupal_content_types[0];
-        $response = $client->request('GET', $url, [
-            'http_errors' => false,
-            // @todo: Loop through this array and add each header.
-            'headers' => [$this->jsonapi_authorization_headers[0]],
-            // Sort descending by 'changed' so new and updated nodes
-            // get checked immediately after they are added/updated.
-            'query' => ['page[offset]' => $page_offset, 'page[limit]' => $this->page_size, 'sort' => '-changed']
-        ]);
 
-        $status_code = $response->getStatusCode();
-        $node_list = (string) $response->getBody();
-        $node_list_array = json_decode($node_list, true);
+        $next = TRUE;
+        $output_resource_records = [];
+        while ($next and (count($output_resource_records) =< $this->batch_size_max)) {
+          $response = $client->request('GET', $url, [
+              'http_errors' => false,
+              // @todo: Loop through this array and add each header.
+              'headers' => [$this->jsonapi_authorization_headers[0]],
+              // Sort descending by 'changed' so new and updated nodes
+              // get checked immediately after they are added/updated.
+              'query' => ['page[offset]' => $page_offset, 'page[limit]' => $this->page_size, 'sort' => '-changed']
+          ]);
 
-        if ($status_code === 200) {
-            $this->setPageOffset($page_offset, $node_list_array['links']);
+          $status_code = $response->getStatusCode();
+          $node_list = (string) $response->getBody();
+          $node_list_array = json_decode($node_list, true);
+
+          if ($status_code === 200) {
+              $this->setPageOffset($page_offset, $node_list_array['links']);
+              if (!isset($node_list_array['links']['next'])) {
+                $next = FALSE;
+              }
+          }
+
+          if (count($node_list_array['data']) == 0) {
+              if ($this->logger) {
+                  $this->logger->info(
+                      "PluginFetchResourceListFromDrupal retrieved an empty node list from Drupal",
+                      array(
+                          'HTTP response code' => $status_code
+                      )
+                  );
+              }
+          }
+
+          foreach ($node_list_array['data'] as $node) {
+              $nid = $node['attributes']['nid'];
+              // Get the media associated with this node using the Islandora-supplied Manage Media View.
+              $media_client = new \GuzzleHttp\Client();
+              $media_url = $this->drupal_base_url . '/node/' . $nid . '/media';
+              $media_response = $media_client->request('GET', $media_url, [
+                  'http_errors' => false,
+                  'auth' => $this->media_auth,
+                  'query' => ['_format' => 'json']
+              ]);
+              $media_status_code = $media_response->getStatusCode();
+              $media_list = (string) $media_response->getBody();
+              $media_list = json_decode($media_list, true);
+
+              if (count($media_list) === 0) {
+                  if ($this->logger) {
+                      $this->logger->info(
+                          "PluginFetchResourceListFromDrupal is skipping node with an empty media list.",
+                          array(
+                              'Node ID' => $nid
+                          )
+                      );
+                  }
+                  continue;
+              }
+
+              // Loop through all the media and pick the ones that are tagged with terms in $taxonomy_terms_to_check.
+              foreach ($media_list as $media) {
+                  if (count($media['field_media_use'])) {
+                      foreach ($media['field_media_use'] as $term) {
+                          if (in_array($term['url'], $this->media_tags)) {
+                              // Get the timestamp of the current revision.
+                              // Will be in ISO8601 format.
+                              $revised = $media['revision_created'][0]['value'];
+                              if ($this->use_fedora_urls) {
+                                  // @todo: getFedoraUrl() returns false on failure, so build in logic here to log that
+                                  // the resource ID / URL cannot be found. (But, http responses are already logged in
+                                  // getFedoraUrl() so maybe we don't need to log here?)
+                                  if (isset($media['field_media_image'])) {
+                                      $fedora_url = $this->getFedoraUrl($media['field_media_image'][0]['target_uuid']);
+                                      if (strlen($fedora_url)) {
+                                          $resource_record_object = new \stdClass;
+                                          $resource_record_object->resource_id = $fedora_url;
+                                          $resource_record_object->last_modified_timestamp = $revised;
+                                          $output_resource_records[] = $resource_record_object;
+                                      }
+                                  } else {
+                                      $fedora_url = $this->getFedoraUrl($media['field_media_file'][0]['target_uuid']);
+                                      if (strlen($fedora_url)) {
+                                          $resource_record_object = new \stdClass;
+                                          $resource_record_object->resource_id = $fedora_url;
+                                          $resource_record_object->last_modified_timestamp = $revised;
+                                          $output_resource_records[] = $resource_record_object;
+                                      }
+                                  }
+                              } else {
+                                  if (isset($media['field_media_image'])) {
+                                      if (strlen($media['field_media_image'][0]['url'])) {
+                                          $resource_record_object = new \stdClass;
+                                          $resource_record_object->resource_id = $media['field_media_image'][0]['url'];
+                                          $resource_record_object->last_modified_timestamp = $revised;
+                                          $output_resource_records[] = $resource_record_object;
+                                      }
+                                  } else {
+                                      if (strlen($media['field_media_file'][0]['url'])) {
+                                          $resource_record_object = new \stdClass;
+                                          $resource_record_object->resource_id = $media['field_media_file'][0]['url'];
+                                          $resource_record_object->last_modified_timestamp = $revised;
+                                          $output_resource_records[] = $resource_record_object;
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+
+          // $this->logger is null while testing.
+          if ($this->logger) {
+              $this->logger->info("PluginFetchResourceListFromDrupal executed");
+          }
         }
-
-        if (count($node_list_array['data']) == 0) {
-            if ($this->logger) {
-                $this->logger->info(
-                    "PluginFetchResourceListFromDrupal retrieved an empty node list from Drupal",
-                    array(
-                        'HTTP response code' => $status_code
-                    )
-                );
-            }
-        }
-
-        $output_resource_records = array();
-        foreach ($node_list_array['data'] as $node) {
-            $nid = $node['attributes']['nid'];
-            // Get the media associated with this node using the Islandora-supplied Manage Media View.
-            $media_client = new \GuzzleHttp\Client();
-            $media_url = $this->drupal_base_url . '/node/' . $nid . '/media';
-            $media_response = $media_client->request('GET', $media_url, [
-                'http_errors' => false,
-                'auth' => $this->media_auth,
-                'query' => ['_format' => 'json']
-            ]);
-            $media_status_code = $media_response->getStatusCode();
-            $media_list = (string) $media_response->getBody();
-            $media_list = json_decode($media_list, true);
-
-            if (count($media_list) === 0) {
-                if ($this->logger) {
-                    $this->logger->info(
-                        "PluginFetchResourceListFromDrupal is skipping node with an empty media list.",
-                        array(
-                            'Node ID' => $nid
-                        )
-                    );
-                }
-                continue;
-            }
-
-            // Loop through all the media and pick the ones that are tagged with terms in $taxonomy_terms_to_check.
-            foreach ($media_list as $media) {
-                if (count($media['field_media_use'])) {
-                    foreach ($media['field_media_use'] as $term) {
-                        if (in_array($term['url'], $this->media_tags)) {
-                            // Get the timestamp of the current revision.
-                            // Will be in ISO8601 format.
-                            $revised = $media['revision_created'][0]['value'];
-                            if ($this->use_fedora_urls) {
-                                // @todo: getFedoraUrl() returns false on failure, so build in logic here to log that
-                                // the resource ID / URL cannot be found. (But, http responses are already logged in
-                                // getFedoraUrl() so maybe we don't need to log here?)
-                                if (isset($media['field_media_image'])) {
-                                    $fedora_url = $this->getFedoraUrl($media['field_media_image'][0]['target_uuid']);
-                                    if (strlen($fedora_url)) {
-                                        $resource_record_object = new \stdClass;
-                                        $resource_record_object->resource_id = $fedora_url;
-                                        $resource_record_object->last_modified_timestamp = $revised;
-                                        $output_resource_records[] = $resource_record_object;
-                                    }
-                                } else {
-                                    $fedora_url = $this->getFedoraUrl($media['field_media_file'][0]['target_uuid']);
-                                    if (strlen($fedora_url)) {
-                                        $resource_record_object = new \stdClass;
-                                        $resource_record_object->resource_id = $fedora_url;
-                                        $resource_record_object->last_modified_timestamp = $revised;
-                                        $output_resource_records[] = $resource_record_object;
-                                    }
-                                }
-                            } else {
-                                if (isset($media['field_media_image'])) {
-                                    if (strlen($media['field_media_image'][0]['url'])) {
-                                        $resource_record_object = new \stdClass;
-                                        $resource_record_object->resource_id = $media['field_media_image'][0]['url'];
-                                        $resource_record_object->last_modified_timestamp = $revised;
-                                        $output_resource_records[] = $resource_record_object;
-                                    }
-                                } else {
-                                    if (strlen($media['field_media_file'][0]['url'])) {
-                                        $resource_record_object = new \stdClass;
-                                        $resource_record_object->resource_id = $media['field_media_file'][0]['url'];
-                                        $resource_record_object->last_modified_timestamp = $revised;
-                                        $output_resource_records[] = $resource_record_object;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // $this->logger is null while testing.
-        if ($this->logger) {
-            $this->logger->info("PluginFetchResourceListFromDrupal executed");
-        }
- 
         return $output_resource_records;
     }
 
